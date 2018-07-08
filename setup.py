@@ -29,34 +29,39 @@ if sys.argv[-1] == 'publish':
 readme = open('README.rst').read()
 requires = [pkg for pkg in open('requirements.txt').readlines()]
 
+# append the python2 requirements
+if sys.version_info[0] == 2:
+    requires.extend([pkg for pkg in open('requirements-py2.txt').readlines()])
+
 setup(
     name='agavepy',
-    version='0.2',
+    version='0.7.2',
     description='SDK for Agave',
     long_description=readme,
     author='Joe Stubbs, Walter Moreira',
     author_email='jstubbs@tacc.utexas.edu, wmoreira@tacc.utexas.edu',
-    url='https://bitbucket.org/taccaci/agavepy',
+    url='https://github.com/TACC/agavepy',
     packages=[
         'agavepy',
         'agavepy.swaggerpy'
     ],
     package_dir={'agavepy': 'agavepy'},
-    package_data={'agavepy': ['resources.json']},
+    package_data={'agavepy': ['resources.json', 'resources.json.j2']},
+    data_files=[('', ['requirements.txt', 'requirements-py2.txt'])],
     install_requires=requires,
-    license="MIT",
+    license="BSD",
     zip_safe=False,
     keywords='',
     classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: BSD License',
         'Natural Language :: English',
         "Programming Language :: Python :: 2",
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.3',
+        'Programming Language :: Python :: 3.6'
     ],
     cmdclass={'test': PyTest},
     tests_require=['pytest'],

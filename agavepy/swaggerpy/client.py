@@ -9,9 +9,11 @@ import json
 import logging
 import os.path
 import re
-import urllib
+import urllib.request, urllib.parse, urllib.error
 import swaggerpy
 from numbers import Real
+
+from requests_toolbelt import MultipartEncoder
 
 from swaggerpy.http_client import SynchronousHttpClient
 from swaggerpy.processors import WebsocketProcessor, SwaggerProcessor
@@ -50,7 +52,7 @@ class Operation(object):
     def file_like(self, obj):
         """Try to decide if we should put this object in multipart."""
 
-        primitives = (basestring, Real)
+        primitives = (str, Real)
         return not isinstance(obj, primitives)
 
     def __call__(self, **kwargs):
@@ -59,23 +61,52 @@ class Operation(object):
         :param kwargs: ARI operation arguments.
         :return: Implementation specific response or WebSocket connection
         """
-        log.info("%s?%r" % (self.json['nickname'], urllib.urlencode(kwargs)))
-        method = self.json['method']
+        log.info("%s?%r" % (self.json['nickname'], urllib.parse.urlencode(kwargs)))
+        # http method must be native string (for Python 2.x, bytes). This must be done to prevent errors when trying to
+        # upload binary data because when unicode is passed, the concatenated request string gets decoded using the
+        # default encoding (ASCII) and that breaks on binary data. See the bottom of this thread:
+        # https://github.com/kennethreitz/requests/issues/1252
+        method = str(self.json['method'])
         uri = self.uri
         params = {}
         data = {}
         headers = {}
         files = {}
+        proxies = kwargs.pop('proxies')
+        # allow passing custom headers
+        if kwargs.get('headers'):
+            try:
+                headers.update(kwargs.pop('headers'))
+            except ValueError:
+                raise AssertionError("Parameter headers must be of type dict.")
+        # allow passing a custom query dict
+        if kwargs.get('query'):
+            try:
+                params.update(kwargs.pop('query'))
+            except ValueError:
+                raise AssertionError("Parameter query must be of type dict.")
         accepts_multipart = ('multipart/form-data' in
                              self.json.get('consumes', []))
+        # allow passing an `x-nonce`
+        if kwargs.get('nonce'):
+            nonce = kwargs.get('nonce')
+            params['x-nonce'] = nonce
+            del kwargs['nonce']
+
         for param in self.json.get('parameters', []):
             pname = param['name']
+            ptype = param['type']
             value = kwargs.get(pname)
+            if ptype == 'dict':
+                if value and param['paramType'] == 'query':
+                    try:
+                        params.update(value)
+                    except ValueError:
+                        raise AssertionError("Parameter {} must be of type dict.".format(pname))
             # Turn list params into comma separated values
             if isinstance(value, list):
                 value = ",".join(value)
-
-            if value:
+            if value is not None:
                 param_type = param['paramType']
                 if param_type == 'path':
                     uri = uri.replace('{%s}' % pname, str(value))
@@ -83,13 +114,31 @@ class Operation(object):
                     params[pname] = value
                 elif param_type == 'form':
                     if accepts_multipart and self.file_like(value):
-                        files[pname] = value
+                        # AD-1345 : issue uploading large files (see ticket).
+                        try:
+                            file_name = os.path.basename(value.name)
+                        except AttributeError:
+                            raise TypeError("File upload object must have a name attribute.")
+                        m = MultipartEncoder(fields = {pname: (file_name, value, 'text/plain')})
+                        headers['Content-type'] = m.content_type
+                        data = m
                     else:
                         data[pname] = value
                 elif param_type == 'body':
-                    data = (value if isinstance(value, basestring)
-                            else json.dumps(value))
-                    headers = {'Content-type': 'application/json'}
+                    isjson = True
+                    if isinstance(value, str):
+                        data = value
+                    else:
+                        try:
+                            data = json.dumps(value)
+                        except TypeError:
+                            data = value
+                            if not headers.get('Content-type') \
+                                or headers.get('Content-type') == 'application/octet-stream':
+                                isjson = False
+                                headers['Content-type'] = 'application/octet-stream'
+                    if isjson:
+                        headers['Content-type'] = 'application/json'
                 else:
                     raise AssertionError(
                         "Unsupported paramType %s" %
@@ -100,9 +149,25 @@ class Operation(object):
                     raise TypeError(
                         "Missing required parameter '%s' for '%s'" %
                         (pname, self.json['nickname']))
+        if method.lower() == 'get':
+            # look for the search dictionary on GET requests:
+            value = kwargs.get('search')
+            if value:
+                if not isinstance(value, dict):
+                    raise TypeError("search parameter must be of type dict")
+                for k, v in list(value.items()):
+                    params[k] = v
+                kwargs.pop('search')
+            value = kwargs.get('filter')
+            if value:
+                if not isinstance(value, str):
+                    raise TypeError("filter parameter must be of type str")
+                params['filter'] = value
+                kwargs.pop('filter')
+
         if kwargs:
             raise TypeError("'%s' does not have parameters %r" %
-                            (self.json['nickname'], kwargs.keys()))
+                            (self.json['nickname'], list(kwargs.keys())))
 
         log.info("%s %s(%r)", method, uri, params)
         if self.json['is_websocket']:
@@ -112,7 +177,7 @@ class Operation(object):
         else:
             return self.http_client.request(
                 method, uri, params=params,
-                data=data, headers=headers, files=files)
+                data=data, headers=headers, files=files, proxies=proxies)
 
 
 class Resource(object):
@@ -200,7 +265,7 @@ class SwaggerClient(object):
             processors.extend(extra_processors)
         loader = swaggerpy.Loader(http_client, processors)
 
-        if isinstance(url_or_resource, basestring):
+        if isinstance(url_or_resource, str):
             log.debug("Loading from %s" % url_or_resource)
             self.api_docs = loader.load_resource_listing(url_or_resource)
         else:

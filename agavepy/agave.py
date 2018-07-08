@@ -1,10 +1,16 @@
 import xml.etree.ElementTree as ElementTree
 from functools import wraps
-import urlparse
+
+from future import standard_library
+standard_library.install_aliases()
+
+#import urllib.parse
+import urllib.request, urllib.parse, urllib.error
 import os
 import shelve
 from contextlib import closing
 import json
+import time
 
 import jinja2
 import dateutil.parser
@@ -13,9 +19,9 @@ import requests
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
-from swaggerpy.client import SwaggerClient
-from swaggerpy.http_client import SynchronousHttpClient
-from swaggerpy.processors import SwaggerProcessor
+from .swaggerpy.client import SwaggerClient
+from .swaggerpy.http_client import SynchronousHttpClient
+from .swaggerpy.processors import SwaggerProcessor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,28 +35,6 @@ def json_response(f):
     return _f
 
 
-def save(client, key, secret):
-    """
-
-    :type client: str
-    :type key: str
-    :type secret: str
-    :rtype: None
-    """
-    with closing(shelve.open(os.path.expanduser('~/.agavepy'))) as agavepyrc:
-        agavepyrc[str(client)] = (key, secret)
-
-
-def recover(name):
-    """Try to recover api keys for client ``name``.
-
-    :type name: str
-    :rtype: (str, str)
-    """
-    with closing(shelve.open(os.path.expanduser('~/.agavepy'))) as agavepyrc:
-        return agavepyrc[str(name)]
-
-
 def load_resource(api_server):
     """Load a default resource file.
 
@@ -61,22 +45,27 @@ def load_resource(api_server):
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(HERE),
                              trim_blocks=True, lstrip_blocks=True)
     rsrcs = json.loads(conf.compile(
-        {'api_server_base': urlparse.urlparse(api_server).netloc}, env))
+        {'api_server_base': urllib.parse.urlparse(api_server).netloc}, env))
     return rsrcs
 
 def with_refresh(client, f, *args, **kwargs):
     """Call function ``f`` and refresh token if needed."""
-
     try:
         return f(*args, **kwargs)
     except requests.exceptions.HTTPError as exc:
         try:
+            # Old versions of APIM return errors in XML:
             code = ElementTree.fromstring(exc.response.text)[0].text
         except Exception:
-            # Any error here means the response was no XML
+            # Any error here means the response was not XML.
             try:
-                # Try to see if it's a json response, and if so, return it
-                exc.response.json()
+                # Try to see if it's a json response,
+                exc_json = exc.response.json()
+                # if so, check if it is an expired token error (new versions of APIM return JSON errors):
+                if 'Invalid Credentials' in exc_json.get('fault').get('message'):
+                    client.token.refresh()
+                    return f(*args, **kwargs)
+                #  otherwise, return the JSON
                 return exc.response
             except Exception:
                 # Re-raise it, as it's not an expired token
@@ -103,31 +92,56 @@ class Token(object):
     def __init__(self,
                  username, password,
                  api_server, api_key, api_secret, verify,
-                 parent, _token=None, _refresh_token=None):
+                 parent, _token=None, _refresh_token=None, token_username=None,
+                 expires_at=None, expires_in=None, created_at=None):
         self.username = username
         self.password = password
         self.api_server = api_server
         self.api_key = api_key
         self.api_secret = api_secret
+        self.token_username = token_username
         # Agave object that created this token
         self.parent = parent
         self.verify = verify
         if _token and _refresh_token:
             self.token_info = {'access_token': _token,
                                'refresh_token': _refresh_token}
+            self.token_info['expires_at'] = expires_at
+            self.token_info['expires_in'] = expires_in
+            self.token_info['created_at'] = created_at
             self.parent._token = _token
 
-        self.token_url = urlparse.urljoin(self.api_server, 'token')
+        self.token_url = urllib.parse.urljoin(str(self.api_server), 'token')
 
     def _token(self, data):
         auth = requests.auth.HTTPBasicAuth(self.api_key, self.api_secret)
         resp = requests.post(self.token_url, data=data, auth=auth,
-                             verify=self.verify)
+                             verify=self.verify, proxies=self.parent.proxies)
         resp.raise_for_status()
         self.token_info = resp.json()
+        try:
+            expires_in = int(self.token_info.get('expires_in'))
+        except ValueError:
+            expires_in = 3600
+        created_at = int(time.time())
+        self.token_info['created_at'] = created_at
+        self.token_info['expiration'] = created_at + expires_in
+        self.token_info['expires_at'] = time.ctime(created_at + expires_in)
         token = self.token_info['access_token']
-        # Notify parent that a token was created
+        # Update parent with new token data
         self.parent._token = token
+        self.parent.refresh_token = self.token_info['refresh_token']
+        self.parent.created_at = self.token_info['created_at']
+        self.parent.expiration = self.token_info['expiration']
+        self.parent.expires_at = self.token_info['expires_at']
+        # try to persist the token data
+        try:
+            self.parent._write_client()
+        except Exception as e:
+            # writing the cache file cannot block use.
+            pass
+        if self.parent.token_callback:
+            self.parent.token_callback(**self.token_info)
         self.parent.refresh_aris()
         return token
 
@@ -136,6 +150,9 @@ class Token(object):
                 'username': self.username,
                 'password': self.password,
                 'scope': 'PRODUCTION'}
+        if self.token_username:
+            data['grant_type'] = 'admin_password'
+            data['token_username'] = self.token_username
         return self._token(data)
 
     def refresh(self):
@@ -155,16 +172,24 @@ class Agave(object):
         # param name, mandatory?, attr_name, default
         ('username', False, 'username', None),
         ('password', False, 'password', None),
+        ('token_username', False, 'token_username', None),
         ('jwt', False, 'jwt', None),
         ('jwt_header_name', False, 'header_name', None),
         ('api_server', True, 'api_server', None),
+        ('tenant_id', False, 'tenant_id', None),
+        ('expires_in', False, 'expires_in', None),
+        ('expires_at', False, 'expires_at', None),
+        ('created_at', False, 'created_at', None),
         ('client_name', False, 'client_name', None),
         ('api_key', False, 'api_key', None),
         ('api_secret', False, 'api_secret', None),
         ('token', False, '_token', None),
         ('refresh_token', False, '_refresh_token', None),
+        ('use_nonce', False, 'use_nonce', False),
         ('resources', False, 'resources', None),
-        ('verify', False, 'verify', True)
+        ('verify', False, 'verify', True),
+        ('token_callback', False, 'token_callback', None),
+        ('proxies', False, 'proxies', urllib.request.getproxies())
     ]
 
     def __init__(self, **kwargs):
@@ -176,25 +201,139 @@ class Agave(object):
                 raise AgaveError(
                     'parameter "{}" is mandatory'.format(param))
             setattr(self, attr, value)
-
         if self.resources is None:
             self.resources = load_resource(self.api_server)
-        self.host = urlparse.urlsplit(self.api_server).netloc
+        self.host = urllib.parse.urlsplit(self.api_server).netloc
+        if self.token_callback and not hasattr(self.token_callback, '__call__'):
+            raise AgaveError('token_callback must be callable.')
         # If we are passed a JWT directly, we can bypass all OAuth-related tasks
         if self.jwt:
             if not self.header_name:
                 raise AgaveError("The jwt header name is required to use the jwt authenticator.")
-        # If we are given a client name and no keys, then try to retrieve
-        # them from a persistent file.
-        if (self.client_name is not None
-                and self.api_key is None and self.api_secret is None):
-            self.api_key, self.api_secret = recover(self.client_name)
         self.token = None
         if self.api_key is not None and self.api_secret is not None and self.jwt is None:
             self.set_client(self.api_key, self.api_secret)
         self.clients_resource = None
         self.all = None
         self.refresh_aris()
+        if not hasattr(self, 'apps'):
+            raise AgaveError('Required parameters for client instantiation missing.')
+
+    def to_dict(self):
+        """Return a dictionary representing this client."""
+        d = {}
+        if hasattr(self, 'token') and hasattr(self.token, 'token_info'):
+            d = {'token': self.token.token_info.get('access_token'),
+                 'refresh_token': self.token.token_info.get('refresh_token'),
+                 'expires_in': self.token.token_info.get('expires_in'),
+                 'expires_at': self.token.token_info.get('expires_at'),
+                 'created_at': self.token.token_info.get('created_at'),
+                 }
+        d.update({attr: getattr(self, attr) for _, _, attr, _ in self.PARAMS \
+                         if not attr in ['resources', '_token', '_refresh_token', 'header_name', 'jwt', 'password', 'token_callback']})
+        # if we are writing to the .agave/current file, modify the fields accordingly
+        if Agave.agpy_path() == os.path.expanduser('~/.agave/current'):
+            d['tenantid'] = d.pop('tenant_id', '')
+            d['apisecret'] = d.pop('api_secret', '')
+            d['apikey'] = d.pop('api_key', '')
+            d['baseurl'] = d.pop('api_server', '')
+            d['access_token'] = d.pop('token', '')
+        return d
+
+    @classmethod
+    def agpy_path(self):
+        """Return path to .agpy file"""
+        places = [os.path.expanduser('~/.agave/current'),
+                  os.path.expanduser('~/.agpy'),
+                  '/etc/.agpy',
+                  '/root/.agpy',
+                  '/.agpy']
+        for place in places:
+            if os.path.exists(place):
+                return place
+
+    @classmethod
+    def _read_clients(cls):
+        """Read clients from the .agpy file."""
+        with open(Agave.agpy_path()) as agpy:
+            clients = json.loads(agpy.read())
+        # if we are reading the '.agave/current' file, we need to do some translation
+        if Agave.agpy_path() == os.path.expanduser('~/.agave/current'):
+            # first, make sure we have a list; in past versions of the CLI, the current file was a
+            # single JSON object
+            if not isinstance(clients, list):
+                clients = [clients]
+            for client in clients:
+                # convert CLI keys to agavepy keys:
+                for k, v in list(client.items()):
+                    if k == 'tenantid':
+                        client['tenant_id'] = v
+                    elif k == 'apisecret':
+                        client['api_secret'] = v
+                    elif k == 'apikey':
+                        client['api_key'] = v
+                    elif k == 'baseurl':
+                        client['api_server'] = v
+                    elif k == 'access_token':
+                        client['token'] = v
+                # add missing attrs:
+                if 'verify' not in client:
+                    # default to verifying SSL:
+                    client['verify'] = True
+        return clients
+
+    @classmethod
+    def _restore_client(cls, **kwargs):
+        """Restore a client from a specific attr."""
+        clients = Agave._read_clients()
+        if len(clients) == 0:
+            raise AgaveError("No clients found.")
+        # if no attribute was passed, we'll just restore the first client in the list:
+        if len(list(kwargs.items())) == 0:
+            return Agave(**clients[0])
+        for k, v in list(kwargs.items()):
+            for client in clients:
+                if client.get(k) == v:
+                    return Agave(**client)
+        raise AgaveError("No matching client found.")
+
+    @classmethod
+    def restore(cls, api_key=None, client_name=None, tenant_id=None):
+        """Public API to restore an agave client from a file."""
+        if api_key:
+            return Agave._restore_client(api_key=api_key)
+        elif client_name:
+            return Agave._restore_client(client_name=client_name)
+        elif tenant_id:
+            return Agave._restore_client(tenant_id=tenant_id)
+        else:
+            return Agave._restore_client()
+
+    def _write_client(self):
+        """Update the .agpy file with the description of a client."""
+        # if we are reading the '.agave/current' file, we need to use that format and simply update
+        # a few fields
+        if Agave.agpy_path() == os.path.expanduser('~/.agave/current'):
+            with open(Agave.agpy_path(), 'r') as agpy:
+                old_data = json.loads(agpy.read())
+            new_data = self.to_dict()
+            old_data['access_token'] = new_data['access_token']
+            old_data['refresh_token'] = new_data['refresh_token']
+            with open(Agave.agpy_path(), 'w') as agpy:
+                agpy.write(json.dumps(new_data))
+
+        else:
+            clients = Agave._read_clients()
+            new_clients = []
+            for client in clients:
+                # if this is the current client, update with the latest representation
+                if client.get('api_key') == self.api_key or client.get('client_name') == self.client_name:
+                    new_clients.append(self.to_dict())
+                else:
+                    # otherwise, write what is already there.
+                    new_clients.append(client)
+            with open(Agave.agpy_path(), 'w') as agpy:
+                agpy.write(json.dumps(new_clients))
 
     def refresh_aris(self):
         self.clients_ari()
@@ -202,6 +341,8 @@ class Agave(object):
         # we need to refresh using a different method
         if self.jwt:
             self.jwt_ari()
+        elif self.use_nonce:
+            self.nonce_ari()
         else:
             self.full_ari()
 
@@ -216,6 +357,11 @@ class Agave(object):
         # bearer token
         self.all = self.resource(
             'token', 'host', '_token')
+
+    def nonce_ari(self):
+        # if use_nonce is passed in, we use the NonceAuthenticator which does not require any credentials at
+        # the time of instantiation.
+        self.all = self.resource('nonce', 'host')
 
     def jwt_ari(self):
         # If a jwt is passed in, create a resource object with the header_name and jwt token:
@@ -246,8 +392,14 @@ class Agave(object):
             self.username, self.password,
             self.api_server, self.api_key, self.api_secret,
             self.verify,
-            self, self._token, self._refresh_token)
-        if self._token and self._refresh_token:
+            self,
+            self._token,
+            self._refresh_token,
+            self.token_username,
+            self.expires_at,
+            self.expires_in,
+            self.created_at)
+        if self._token:
             pass
         else:
             self.token.create()
@@ -260,16 +412,51 @@ class Agave(object):
         """
         f = requests.get
         return with_refresh(self.client, f, url,
-                            headers={'Authorization': 'Bearer ' + self.token.token_info['access_token']},
-                            verify=self.verify)
+                            headers={'Authorization': 'Bearer ' + self._token},
+                            verify=self.verify,
+                            proxies=self.proxies)
+
+    def download_uri(self, uri, local_path):
+        """Convenience method to download an agave URL or jobs output URL to an
+        absolute `path` on the local file system."""
+        if uri.startswith('http') and 'jobs' in uri:
+            # assume job output uri:
+            if '/outputs/listings/' in uri:
+                download_url = uri.replace('listings', 'media')
+            elif '/outputs/media/' in uri:
+                download_url = uri
+            else:
+                raise AgaveError("Unsupported jobs URI.")
+        elif 'agave://' in uri:
+            # assume it is an agave uri
+            system_id, path = uri.split('agave://')[1].split('/', 1)
+            download_url = '{}/files/v2/media/system/{}/{}'.format(self.api_server, system_id, path)
+        else:
+            raise AgaveError("Unsupported URI.")
+        f = requests.get
+        with open(local_path, 'wb') as loc:
+            rsp = with_refresh(self.client, f, download_url,
+                               headers={'Authorization': 'Bearer ' + self.token.token_info['access_token']},
+                               verify=self.verify,
+                               proxies=self.proxies)
+            rsp.raise_for_status()
+            if type(rsp) == dict:
+                raise AgaveError("Error downloading file at URI: {}, Response: {}".format(uri, rsp))
+            for block in rsp.iter_content(1024):
+                if not block:
+                    break
+                loc.write(block)
+
 
     def __getattr__(self, key):
         return Resource(key, client=self)
 
     def __dir__(self):
-        base = self.clients_resource.resources.keys()
+        base = []
+        if hasattr(self, 'clients_resource') and hasattr(self.clients_resource, 'resources'):
+            base.extend(list(self.clients_resource.resources.keys()))
         if self.all is not None:
-            base.extend(self.all.resources.keys())
+            base.extend(list(self.all.resources.keys()))
         return list(set(base))
 
 
@@ -283,11 +470,14 @@ class Resource(object):
         return Operation(self.resource, attr, client=self.client)
 
     def __dir__(self):
-        clients = self.client.clients_resource.resources
-        base = clients[self.resource].operations.keys()
+        if hasattr(self, 'clients_resource') and hasattr(self.clients_resource, 'resources'):
+            clients = self.client.clients_resource.resources
+            base = list(clients[self.resource].operations.keys())
+        else:
+            base = []
         if self.client.all is not None:
             base.extend(
-                self.client.all.resources[self.resource].operations.keys())
+                list(self.client.all.resources[self.resource].operations.keys()))
         return base
 
 
@@ -297,7 +487,7 @@ class AgaveException(Exception):
 
 class Operation(object):
 
-    PRIMITIVE_TYPES = ['array', 'string', 'integer', 'int', 'boolean']
+    PRIMITIVE_TYPES = ['array', 'string', 'integer', 'int', 'boolean', 'dict']
 
     def __init__(self, resource, operation, client):
         self.resource = resource
@@ -336,20 +526,24 @@ class Operation(object):
             response.raise_for_status()
             return response
 
+        kwargs['proxies'] = self.client.proxies
         resp = with_refresh(self.client, operation)
         if resp.ok:
+            # if response is 204 (no content) return none directly
+            if resp.status_code == 204 and not resp.content:
+                return resp
             # if response is raw file, return it directly
             if (self.resource == 'files' and
                     (self.operation == 'download'
                      or self.operation == 'downloadFromDefaultSystem')):
                 return resp
-            result = self.post_process(resp.json(),
-                                       self.return_type)['result']
+            # if response is a result, return it directly as well:
+            if (self.resource == 'actors' and self.operation == 'getOneExecutionResult'):
+                return resp
+            processed = self.post_process(resp.json(), self.return_type)
+            result = processed['result'] if 'result' in processed else None
             # if operation is clients.create, save name
             if self.resource == 'clients' and self.operation == 'create':
-                save(result['name'],
-                     result['consumerKey'],
-                     result['consumerSecret'])
                 self.client.set_client(result['consumerKey'],
                                        result['consumerSecret'])
             return result
@@ -369,6 +563,9 @@ class Operation(object):
         return self.process_model(obj, return_type)
 
     def process_untyped(self, obj):
+        return obj
+
+    def process_dict(self, obj, return_type):
         return obj
 
     def process_array(self, obj, return_type):

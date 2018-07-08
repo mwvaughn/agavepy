@@ -10,7 +10,7 @@
 import logging
 import requests
 import requests.auth
-import urlparse
+import urllib.parse
 import websocket
 
 log = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ class Authenticator(object):
         :param url: URL to check.
         :return: True if matches host, port and scheme, False otherwise.
         """
-        split = urlparse.urlsplit(url)
+        split = urllib.parse.urlsplit(url)
         return self.host == split.hostname
 
     def apply(self, request):
@@ -153,6 +153,17 @@ class TokenAuthenticator(Authenticator):
     def apply(self, request):
         request.headers['Authorization'] = 'Bearer {}'.format(self.token)
 
+class NonceAuthenticator(Authenticator):
+    """ The NonceAuthenticator can be used when no authentication credentials are present at the time
+    of the client instantiation. The assumption is that a nonce or token will be provided at request
+    time to authenticate.
+    """
+    def __init__(self, host):
+        super(NonceAuthenticator, self).__init__(host)
+
+    def apply(self, request):
+        pass
+
 class JwtAuthenticator(Authenticator):
 
     def __init__(self, host, header_name, jwt):
@@ -162,6 +173,7 @@ class JwtAuthenticator(Authenticator):
 
     def apply(self, request):
         request.headers[self.header_name] = self.jwt
+        request.url = request.url.strip('/v2')
 
 # noinspection PyDocstring
 class SynchronousHttpClient(HttpClient):
@@ -193,8 +205,11 @@ class SynchronousHttpClient(HttpClient):
     def set_jwt(self, host, header_name, jwt):
         self.authenticator = JwtAuthenticator(host, header_name, jwt)
 
+    def set_nonce(self, host):
+        self.authenticator = NonceAuthenticator(host)
+
     def request(self, method, url, params=None, data=None,
-                headers=None, files=None):
+                headers=None, files=None, proxies=None):
         """Requests based implementation.
 
         :return: Requests response
@@ -205,7 +220,7 @@ class SynchronousHttpClient(HttpClient):
             headers=headers, files=files)
         self.apply_authentication(req)
         return self.session.send(self.session.prepare_request(req),
-                                 verify=self.verify)
+                                 verify=self.verify, proxies=proxies)
 
     def ws_connect(self, url, params=None):
         """Websocket-client based implementation.
@@ -221,7 +236,7 @@ class SynchronousHttpClient(HttpClient):
         preped_req = proto_req.prepare()
         # Pull the Authorization header, if needed
         header = ["%s: %s" % (k, v)
-                  for (k, v) in preped_req.headers.items()
+                  for (k, v) in list(preped_req.headers.items())
                   if k == 'Authorization']
         # Pull the URL, which includes query params
         url = preped_req.url
